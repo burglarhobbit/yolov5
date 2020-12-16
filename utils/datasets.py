@@ -82,6 +82,43 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
                         collate_fn=LoadImagesAndLabels.collate_fn)
     return dataloader, dataset
 
+def create_all_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
+                      rank=-1, world_size=1, workers=8, image_weights=False):
+    # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
+    with torch_distributed_zero_first(rank):
+        dataset = LoadImagesAndLabels(path, imgsz, batch_size,
+                                      augment=augment,  # augment images
+                                      hyp=hyp,  # augmentation hyperparameters
+                                      rect=rect,  # rectangular training
+                                      cache_images=cache,
+                                      single_cls=opt.single_cls,
+                                      stride=int(stride),
+                                      pad=pad,
+                                      rank=rank,
+                                      image_weights=image_weights)
+
+    batch_size = min(batch_size, len(dataset))
+    nw = min([os.cpu_count() // world_size, batch_size if batch_size > 1 else 0, workers])  # number of workers
+    sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
+    loader = torch.utils.data.DataLoader if image_weights else InfiniteDataLoader
+    # Use torch.utils.data.DataLoader() if dataset.properties will update during training else InfiniteDataLoader()
+
+    print("Length:",len(dataset))
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [1565, 398])
+    train_dataloader = loader(train_dataset,
+                        batch_size=batch_size,
+                        num_workers=nw,
+                        sampler=sampler,
+                        pin_memory=True,
+                        collate_fn=LoadImagesAndLabels.collate_fn)
+    val_dataloader = loader(val_dataset,
+                        batch_size=batch_size,
+                        num_workers=nw,
+                        sampler=sampler,
+                        pin_memory=True,
+                        collate_fn=LoadImagesAndLabels.collate_fn)
+    return train_dataloader, train_dataset, val_dataloader
+
 
 class InfiniteDataLoader(torch.utils.data.dataloader.DataLoader):
     """ Dataloader that reuses workers
@@ -326,8 +363,12 @@ class LoadStreams:  # multiple IP or RTSP cameras
     def __len__(self):
         return 0  # 1E12 frames = 32 streams at 30 FPS for 30 years
 
-
 def img2label_paths(img_paths):
+    # Define label paths as a function of image paths
+    sa, sb = os.sep + 'frames' + os.sep, os.sep + 'annotation' + os.sep  # /images/, /labels/ substrings
+    return [x.replace(sa, sb, 1).replace('.' + x.split('.')[-1], '.txt') for x in img_paths]
+
+def img2label_paths_old(img_paths):
     # Define label paths as a function of image paths
     sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
     return [x.replace(sa, sb, 1).replace('.' + x.split('.')[-1], '.txt') for x in img_paths]
@@ -434,6 +475,62 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 pbar.desc = 'Caching images (%.1fGB)' % (gb / 1E9)
 
     def cache_labels(self, path=Path('./labels.cache')):
+        # Cache dataset labels, check images and read shapes
+        x = {}  # dict
+        nm, nf, ne, nc = 0, 0, 0, 0  # number missing, found, empty, duplicate
+        pbar = tqdm(zip(self.img_files, self.label_files), desc='Scanning images', total=len(self.img_files))
+        for i, (im_file, lb_file) in enumerate(pbar):
+            try:
+                # verify images
+                im = Image.open(im_file)
+                # im = im.resize((320, 240))
+                im.verify()  # PIL verify
+                scalar = 1
+                shape = exif_size(im)  # image size (width, height)
+                # print(shape)
+                assert (shape[0] > 9) & (shape[1] > 9), 'image size <10 pixels'
+
+                # verify labels
+                if os.path.isfile(lb_file):
+                    nf += 1  # label found
+                    with open(lb_file, 'r') as f:
+                        l = np.array([x.split() for x in f.read().strip().splitlines()], dtype=np.float32)  # labels
+                    if len(l):
+                        # class x_center y_center width height
+                        # l[:, 0] -= 1
+                        # l[:, 1] = (l[:, 1]+l[:, 3])/(scalar*2*shape[0])
+                        # l[:, 2] = (l[:, 2]+l[:, 4])/(scalar*2*shape[1])
+                        # l[:, 3] = (l[:, 3]-l[:, 1])/(scalar*shape[0])
+                        # l[:, 4] = (l[:, 4]-l[:, 2])/(scalar*shape[1])
+
+                        assert l.shape[1] == 5, 'labels require 5 columns each'
+                        assert (l >= 0).all(), 'negative labels'
+                        assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels'
+                        assert np.unique(l, axis=0).shape[0] == l.shape[0], 'duplicate labels'
+                    else:
+                        ne += 1  # label empty
+                        l = np.zeros((0, 5), dtype=np.float32)
+                else:
+                    nm += 1  # label missing
+                    l = np.zeros((0, 5), dtype=np.float32)
+                x[im_file] = [l, shape]
+            except Exception as e:
+                nc += 1
+                print('WARNING: Ignoring corrupted image and/or label %s: %s' % (im_file, e))
+
+            pbar.desc = f"Scanning '{path.parent / path.stem}' for images and labels... " \
+                        f"{nf} found, {nm} missing, {ne} empty, {nc} corrupted"
+
+        if nf == 0:
+            print(f'WARNING: No labels found in {path}. See {help_url}')
+
+        x['hash'] = get_hash(self.label_files + self.img_files)
+        x['results'] = [nf, nm, ne, nc, i + 1]
+        torch.save(x, path)  # save for next time
+        logging.info(f"New cache created: {path}")
+        return x
+
+    def cache_labels_old(self, path=Path('./labels.cache')):
         # Cache dataset labels, check images and read shapes
         x = {}  # dict
         nm, nf, ne, nc = 0, 0, 0, 0  # number missing, found, empty, duplicate
